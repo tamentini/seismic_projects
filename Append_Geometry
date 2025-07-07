@@ -1,0 +1,168 @@
+#This is a program to append 2D seismic geometry information to trace headers for data in "trcio" format. 
+
+
+import re
+import struct
+import pandas as pd
+import numpy as np
+from scipy.spatial import cKDTree
+
+def remap_trcio_headers_with_cdp_elev(
+    trcio_in: str,
+    trcio_out: str,
+    geom_ods: str
+):
+    # --- 1) read the .ods without headers so we can index by column letter →
+    df = pd.read_excel(geom_ods, engine="odf", header=None)
+
+    COL = {
+        "hdr3":  1,    # B
+        "colC":  2,    # C
+        "colE":  4,    # E
+        "colF":  5,    # F
+        "colH":  7,    # H
+        "colT": 19,    # T
+        "colU": 20,    # U
+        "colV": 21,    # V
+        "colW": 22,    # W
+        "colZ": 25,    # Z
+        "colAA":26,    # AA
+        "colAB":27,    # AB
+        "colAK":36,    # AK
+        "colAL":37,    # AL
+        "colAN":39,    # AN
+        "colAO":40,    # AO
+        "colAP":41,    # AP
+        "colAQ":42,    # AQ
+    }
+
+    df_by3    = df.set_index(COL["hdr3"])
+    df_byT    = df.set_index(COL["colT"])
+    df_double = df.set_index([COL["colAL"], COL["colAK"]])
+
+    # --- 2) scan the ASCII header block to find data_start_offset, etc. ---
+    ascii_lines    = []
+    data_start_off = num_traces = num_values = None
+    endian         = 0
+
+    with open(trcio_in, "rb") as fin:
+        while True:
+            pos  = fin.tell()
+            line = fin.readline()
+            if not line:
+                raise ValueError("EOF before finding data_start_pos")
+            ascii_lines.append(line)
+            txt = line.decode("utf8", "ignore")
+
+            m = re.search(r"#\s*data_start_pos\s*=\s*\(\s*0\s*,\s*(\d+)\s*\)", txt)
+            if m:
+                data_start_off = int(m.group(1))
+            m = re.search(r"#\s*num_traces\s*=\s*(\d+)", txt)
+            if m:
+                num_traces = int(m.group(1))
+            m = re.search(r"#\s*num_values\s*=\s*(\d+)", txt)
+            if m:
+                num_values = int(m.group(1))
+            m = re.search(r"#\s*endian\s*=\s*(\d+)", txt)
+            if m:
+                endian = int(m.group(1))
+
+            if data_start_off is not None and pos + len(line) >= data_start_off:
+                break
+
+        if None in (data_start_off, num_traces, num_values):
+            raise ValueError("Missing one of data_start_pos / num_traces / num_values")
+
+        ascii_end = fin.tell()
+        pad_len   = data_start_off - ascii_end
+        pad_bytes = fin.read(pad_len)
+
+        # prepare to read all traces into memory
+        NWIH         = 64
+        HEADER_BYTES = NWIH * 8
+        TRACE_BYTES  = num_values * 4
+        dbl_fmt      = ">64d" if endian == 1 else "<64d"
+
+        headers_list = []
+        traces_list  = []
+
+        for _ in range(num_traces):
+            hdrb = fin.read(HEADER_BYTES)
+            if len(hdrb) < HEADER_BYTES:
+                break
+            vals = list(struct.unpack(dbl_fmt, hdrb))
+
+            # --- your existing remaps 4a–4d ---
+            row1   = df_by3.loc[vals[2]]
+            vals[10] = float(row1[COL["colZ"]])    # hdr11
+            vals[11] = float(row1[COL["colAA"]])   # hdr12
+            vals[12] = float(row1[COL["colAB"]])   # hdr13
+            vals[19] = float(row1[COL["colE"]])    # hdr20
+            vals[28] = float(row1[COL["colC"]])    # hdr29
+            vals[43] = float(row1[COL["colF"]])    # hdr44
+            vals[45] = float(row1[COL["colC"]])    # hdr46
+
+            offset = vals[9] - 1.0 + float(row1[COL["colH"]])
+            vals[27] = offset  # hdr28
+            vals[46] = offset  # hdr47
+
+            row2      = df_byT.loc[offset]
+            vals[13]  = float(row2[COL["colU"]])   # hdr14
+            vals[14]  = float(row2[COL["colV"]])   # hdr15
+            vals[15]  = float(row2[COL["colW"]])   # hdr16
+
+            row3      = df_double.loc[(offset, vals[28])]
+            vals[5]   = float(row3[COL["colAN"]])  # hdr6
+            vals[6]   = float(row3[COL["colAO"]])  # hdr7
+            vals[16]  = float(row3[COL["colAP"]])  # hdr17
+            vals[57]  = float(row3[COL["colAP"]])  # hdr58
+            vals[17]  = float(row3[COL["colAQ"]])  # hdr18
+            vals[58]  = float(row3[COL["colAQ"]])  # hdr59
+
+            # read the samples
+            trace_bytes = fin.read(TRACE_BYTES)
+            if len(trace_bytes) < TRACE_BYTES:
+                break
+
+            headers_list.append(vals)
+            traces_list.append(trace_bytes)
+
+        tail_bytes = fin.read()
+
+    # --- 3) build a KD-tree of all (hdr14,hdr15) → hdr16 points ---
+    pts = np.vstack([
+        [h[13], h[14]] for h in headers_list
+    ])
+    elev = np.array([h[15] for h in headers_list])
+    tree = cKDTree(pts)
+
+    # --- 4) for each trace, find nearest grid-point to (hdr17,hdr18) and copy its hdr16 → hdr19 ---
+    for h in headers_list:
+        query_pt = (h[16], h[17])
+        _, idx   = tree.query(query_pt)
+        h[18]    = elev[idx]    # header #19
+
+    # --- 5) write everything back out ---
+    with open(trcio_out, "wb") as fout:
+        # ASCII header + pad
+        for L in ascii_lines:
+            fout.write(L)
+        fout.write(pad_bytes)
+
+        # all traces
+        for vals, tb in zip(headers_list, traces_list):
+            fout.write(struct.pack(dbl_fmt, *vals))
+            fout.write(tb)
+
+        # any trailing bytes
+        fout.write(tail_bytes)
+
+    print(f"✅ Remap + cdp‐elev fill done on {len(headers_list)} traces → {trcio_out}")
+
+
+if __name__ == "__main__":
+    remap_trcio_headers_with_cdp_elev(
+        "input.trc",
+        "output.trc",
+        "geometry_spreadsheet.ods"
+    )
