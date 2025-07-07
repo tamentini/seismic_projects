@@ -1,5 +1,5 @@
 #This is a program to append 2D seismic geometry information to trace headers for data in "trcio" format. 
-
+#Written in Python3
 
 import re
 import struct
