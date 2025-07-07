@@ -1,0 +1,155 @@
+# This program uses Python's matplotlib to generate a plot of 2D seismic lines based on information provided in an associated spreadsheet (.odf format).
+# Map display of shot and receiver positions, midpoint line, midpoint scatter, cdp bins, and optionally fold. Allows pan and zoom action.
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
+from matplotlib.path import Path
+import matplotlib.cm as cm
+import matplotlib.colors as colors
+
+# --- Load ODS File ---
+ods_path = "121_76GEOM.ods"
+df = pd.read_excel(ods_path, engine="odf")
+
+# --- Extract bin center coordinates and numbers ---
+bin_df = df[['Unnamed: 29', 'MIDPOINT X', 'MIDPOINT Y']].dropna()
+bin_df.columns = ['BIN_NUMBER', 'BIN_X', 'BIN_Y']
+bin_df = bin_df.drop_duplicates(subset='BIN_NUMBER')
+bin_df = bin_df.sort_values(by='BIN_NUMBER').reset_index(drop=True)
+
+# --- Bin size settings ---
+crossline_width = 800
+
+# --- Compute shared-edge bin polygons ---
+bin_polygons = []
+centers = bin_df[['BIN_X', 'BIN_Y']].values
+num_bins = len(centers)
+
+edges = []
+for i in range(num_bins - 1):
+    x1, y1 = centers[i]
+    x2, y2 = centers[i + 1]
+    xm, ym = (x1 + x2) / 2, (y1 + y2) / 2
+    dx, dy = x2 - x1, y2 - y1
+    norm = np.hypot(dx, dy)
+    nx, ny = -dy / norm, dx / norm
+    half_cross = crossline_width / 2
+    e1 = [xm - nx * half_cross, ym - ny * half_cross]
+    e2 = [xm + nx * half_cross, ym + ny * half_cross]
+    edges.append((e1, e2))
+
+for i in range(num_bins):
+    bin_number = bin_df.loc[i, 'BIN_NUMBER']
+    if i == 0:
+        front = edges[0]
+        x0, y0 = centers[i]
+        dx, dy = centers[i + 1] - centers[i]
+        norm = np.hypot(dx, dy)
+        nx, ny = -dy / norm, dx / norm
+        back = ([x0 - nx * crossline_width / 2, y0 - ny * crossline_width / 2],
+                [x0 + nx * crossline_width / 2, y0 + ny * crossline_width / 2])
+    elif i == num_bins - 1:
+        back = edges[-1]
+        x0, y0 = centers[i]
+        dx, dy = centers[i] - centers[i - 1]
+        norm = np.hypot(dx, dy)
+        nx, ny = -dy / norm, dx / norm
+        front = ([x0 - nx * crossline_width / 2, y0 - ny * crossline_width / 2],
+                 [x0 + nx * crossline_width / 2, y0 + ny * crossline_width / 2])
+    else:
+        back = edges[i - 1]
+        front = edges[i]
+
+    bin_polygons.append((bin_number, [back[0], front[0], front[1], back[1]]))
+
+# --- Compute source-geophone midpoints ---
+shot_coords = df[['SHOTPOINT', 'SOURCES', 'Unnamed: 26']].dropna()
+shot_coords.columns = ['SHOTPOINT', 'SHOT_X', 'SHOT_Y']
+shot_coords['SHOTPOINT'] = shot_coords['SHOTPOINT'].astype(int)
+
+geo_coords = df[['Unnamed: 19', 'STATIONS', 'Unnamed: 21']].dropna()
+geo_coords.columns = ['GEOPHONE', 'GEO_X', 'GEO_Y']
+geo_coords['GEOPHONE'] = geo_coords['GEOPHONE'].astype(int)
+geo_lookup = geo_coords.set_index('GEOPHONE')[['GEO_X', 'GEO_Y']]
+
+mid_x = []
+mid_y = []
+for idx, row in df.iterrows():
+    try:
+        shotpoint = int(row['SHOTPOINT'])
+        geo_start = int(row['1ST GEO'])
+        geo_end = int(row['Last GEO'])
+        shot_row = shot_coords[shot_coords['SHOTPOINT'] == shotpoint]
+        if shot_row.empty:
+            continue
+        shot_x = shot_row['SHOT_X'].values[0]
+        shot_y = shot_row['SHOT_Y'].values[0]
+        for g in range(geo_start, geo_end + 1):
+            if g in geo_lookup.index:
+                gx, gy = geo_lookup.loc[g]
+                mid_x.append((shot_x + gx) / 2)
+                mid_y.append((shot_y + gy) / 2)
+    except:
+        continue
+midpoints = np.column_stack((mid_x, mid_y))
+
+# --- Fold count ---
+fold_counts = []
+paths = [Path(polygon) for _, polygon in bin_polygons]
+for path in paths:
+    inside = path.contains_points(midpoints)
+    fold_counts.append(np.sum(inside))
+
+cmap = cm.get_cmap('plasma')
+norm = colors.Normalize(vmin=min(fold_counts), vmax=max(fold_counts))
+
+# --- Toggle variables ---
+show_fold_overlay = True
+show_fold_number = True
+
+# --- Plotting function ---
+def draw_plot():
+    plt.cla()
+    ax = plt.gca()
+    ax.set_title("2D Seismic Survey with Fold Overlay (press 't' to toggle)")
+    ax.set_xlabel("X Coordinate")
+    ax.set_ylabel("Y Coordinate")
+
+    ax.scatter(mid_x, mid_y, color='red', s=0.3, label='Source-Geophone Midpoints')
+    ax.scatter(df['MIDPOINT X'].dropna(), df['MIDPOINT Y'].dropna(), color='turquoise', s=1, label='Bin Centers')
+    ax.scatter(shot_coords['SHOT_X'], shot_coords['SHOT_Y'], color='blue', s=10, label='Shots')
+    ax.scatter(geo_coords['GEO_X'], geo_coords['GEO_Y'], color='black', s=5, label='Geophones')
+
+    for (bin_number, poly_pts), fold in zip(bin_polygons, fold_counts):
+        facecolor = cmap(norm(fold)) if show_fold_overlay else 'none'
+        poly = Polygon(poly_pts, closed=True, facecolor=facecolor, edgecolor='green', linewidth=0.6)
+        ax.add_patch(poly)
+        cx = np.mean([pt[0] for pt in poly_pts])
+        cy = np.mean([pt[1] for pt in poly_pts])
+        label = str(fold) if show_fold_overlay and show_fold_number else str(int(bin_number))
+        ax.text(cx, cy, label, fontsize=6, ha='center', va='center', color='darkgreen')
+
+    if show_fold_overlay:
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, label='Fold Count')
+
+    ax.legend()
+    ax.grid(True)
+    plt.draw()
+
+# --- Interactive toggle ---
+def on_key(event):
+    global show_fold_overlay, show_fold_number
+    if event.key == 't':
+        show_fold_overlay = not show_fold_overlay
+        show_fold_number = show_fold_overlay
+        draw_plot()
+
+fig = plt.figure(figsize=(14, 12))
+fig.canvas.mpl_connect('key_press_event', on_key)
+draw_plot()
+plt.tight_layout()
+plt.show()
