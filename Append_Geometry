@@ -1,4 +1,6 @@
 #This is a program to append 2D seismic geometry information to trace headers for data in "trcio" format. 
+#Reads seismic data trace by trace, matches the file number and channel number to those provided in an associated .ods spread sheet (Libre Office spread sheet format in Linux), and 
+#adds relevant geometry information (also contained in the .ods spread sheet) to the designated trace headers. This is designed for seismic data in "trcio" format, not SEGY.
 #Written in Python3
 
 import re
