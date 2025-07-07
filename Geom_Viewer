@@ -1,5 +1,6 @@
 # This program uses Python's matplotlib to generate a plot of 2D seismic lines based on information provided in an associated spreadsheet (.odf format).
 # Map display of shot and receiver positions, midpoint line, midpoint scatter, cdp bins, and optionally fold. Allows pan and zoom action.
+# Written in Python3
 
 import pandas as pd
 import numpy as np
